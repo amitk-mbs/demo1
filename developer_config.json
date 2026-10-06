@@ -1,0 +1,12 @@
+{
+  "master_repo": {
+    "url": "https://github.com/your-org/COE_AKC_FullSystem.git",
+    "version": "main"
+  },
+  "submodules": {
+    "COE_AKC_Controls": "v1.2.0",
+    "COE_AKC_ELD": "develop",
+    "COE_AKC_Mechanics_LowFidelity": "PINNED",
+    "COE_AKC_Sensors": "PINNED"
+  }
+}
