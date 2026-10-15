@@ -1,0 +1,359 @@
+<#
+.SYNOPSIS
+    Config-driven visual Git cloner & updater for a Master Repository and its Submodules.
+.DESCRIPTION
+    Clones a parent repository and its submodules if the folder does not exist,
+    or updates the existing local workspace in-place if it already exists.
+    Checks out the configured refine/default branch, tag, or 'pinned' commit.
+#>
+
+# ==============================================================================
+#                           USER CONFIGURATION BLOCK
+# ==============================================================================
+
+$Config = @{
+    # 1. Master Repository Settings
+    MainRepoUrl      = "https://dev.azure.com/your-org/your-project/_git/master-repo"
+    TargetFolderName = "master-workspace" # Leave "" to auto-name from the Git URL
+    
+    # 2. Default / Refine Branch (used when a tag isn't specified)
+    DefaultBranch    = "develop"          # Can be "develop", "refine/my-branch", etc.
+    
+    # 3. Master Repo Target:
+    #    - Set to "" to checkout $DefaultBranch
+    #    - Set to a tag name (e.g., "v1.0.0") or a specific refine branch name
+    MainRepoTarget   = ""                 
+
+    # 4. Fallback Behavior if a specified Tag or Branch is NOT found in a submodule:
+    #    - "pinned"  : Locks submodule to the exact commit recorded by the Master Repo
+    #    - "default" : Checks out the $DefaultBranch defined above
+    MissingTagFallback = "pinned"
+
+    # 5. How to handle uncommitted local changes when updating an existing folder:
+    #    - "stash"  : Automatically runs 'git stash' before switching branches/tags
+    #    - "prompt" : Asks you what to do if dirty files are detected
+    #    - "ignore" : Leaves changes as-is (Git may block checkout if conflicts exist)
+    HandleUncommittedChanges = "stash"
+
+    # 6. Submodule Specific Configurations:
+    #    Key   = Submodule path/name (as listed in .gitmodules)
+    #    Value = Options:
+    #            ""               -> Uses $DefaultBranch (e.g., 'develop' or refine branch)
+    #            "pinned"         -> Uses the commit hash pinned by the Master Repo
+    #            "v1.2.0"         -> Checks out this specific tag (falls back if missing)
+    #            "refine/xyz"     -> Checks out this specific branch (falls back if missing)
+    Submodules = @{
+        "mechanics" = ""                # Will checkout DefaultBranch
+        "controls"  = "v2.1.0"          # Will checkout tag 'v2.1.0' (or fallback if missing)
+        "ELD"       = "pinned"          # Will stay at the Master Repo's pinned commit
+        "sensors"   = "refine/calib-v2" # Will checkout 'refine/calib-v2' branch
+    }
+}
+
+# ==============================================================================
+#                              HELPER FUNCTIONS
+# ==============================================================================
+
+function Test-GitRef {
+    param ([string]$RefName)
+    
+    if ([string]::IsNullOrWhiteSpace($RefName)) {
+        return @{ Exists = $false; Type = "None"; FullRef = "" }
+    }
+
+    # Check if it's an exact tag
+    git show-ref --verify --quiet "refs/tags/$RefName"
+    if ($LASTEXITCODE -eq 0) {
+        return @{ Exists = $true; Type = "Tag"; FullRef = "tags/$RefName" }
+    }
+    
+    # Check if it's an exact remote branch
+    git show-ref --verify --quiet "refs/remotes/origin/$RefName"
+    if ($LASTEXITCODE -eq 0) {
+        return @{ Exists = $true; Type = "Branch"; FullRef = $RefName }
+    }
+
+    return @{ Exists = $false; Type = "None"; FullRef = "" }
+}
+
+function Protect-WorkingTree {
+    param (
+        [string]$RepoName,
+        [string]$Mode
+    )
+
+    $status = git status --porcelain
+    if (-not [string]::IsNullOrWhiteSpace($status)) {
+        Write-Host "  [!] Uncommitted changes detected in '$RepoName'." -ForegroundColor Yellow
+        
+        if ($Mode.ToLower() -eq "stash") {
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $stashMsg = "Auto-stash by Clone-Updater on $timestamp"
+            Write-Host "  -> Auto-stashing local changes ('$stashMsg')..." -ForegroundColor DarkYellow
+            git stash push -u -m $stashMsg | Out-Null
+        }
+        elseif ($Mode.ToLower() -eq "prompt") {
+            $choice = Read-Host "  [S]tash changes, [D]iscard changes (reset --hard), or [I]gnore? (Default: S)"
+            if ($choice.ToUpper() -eq "D") {
+                Write-Host "  -> Discarding local changes..." -ForegroundColor Red
+                git reset --hard HEAD | Out-Null
+                git clean -fd | Out-Null
+            } elseif ($choice.ToUpper() -eq "I") {
+                Write-Host "  -> Ignoring uncommitted changes (checkout may fail if conflicts exist)..." -ForegroundColor Gray
+            } else {
+                git stash push -u -m "Interactive stash by Clone-Updater" | Out-Null
+                Write-Host "  -> Stashed local changes." -ForegroundColor DarkYellow
+            }
+        }
+    }
+}
+
+# ==============================================================================
+#                              SCRIPT EXECUTION
+# ==============================================================================
+
+Clear-Host
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "     CONFIG-DRIVEN MASTER & SUBMODULE CLONER / UPDATER    " -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Cyan
+
+# 1. Validate URL and Determine Folder Name
+$RepoUrl = $Config.MainRepoUrl
+if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
+    Write-Host "[ERROR] MainRepoUrl is empty in the User Configuration block." -ForegroundColor Red
+    exit 1
+}
+
+$TargetDir = $Config.TargetFolderName
+if ([string]::IsNullOrWhiteSpace($TargetDir)) {
+    $TargetDir = ($RepoUrl -split '/' | Select-Object -Last 1) -replace '\.git$', ''
+}
+$FullTargetPath = Join-Path -Path (Get-Location) -ChildPath $TargetDir
+$DefaultBranch  = $Config.DefaultBranch
+
+Write-Host "`nConfiguration Loaded:" -ForegroundColor Yellow
+Write-Host "  Master Repo    : $RepoUrl" -ForegroundColor Gray
+Write-Host "  Target Path    : $FullTargetPath" -ForegroundColor Gray
+Write-Host "  Default Branch : $DefaultBranch" -ForegroundColor Gray
+Write-Host "  Tag Fallback   : $($Config.MissingTagFallback.ToUpper())" -ForegroundColor Gray
+Write-Host "  Dirty Files    : $($Config.HandleUncommittedChanges.ToUpper())" -ForegroundColor Gray
+
+# 2. Check if Target Folder Exists -> Update vs Clone
+Write-Host "`n----------------------------------------------------------" -ForegroundColor DarkGray
+$isExistingRepo = $false
+
+if (Test-Path $FullTargetPath) {
+    $gitDirPath = Join-Path -Path $FullTargetPath -ChildPath ".git"
+    if (Test-Path $gitDirPath) {
+        $isExistingRepo = $true
+        Write-Host "[1/4] Existing Git repository detected at '$TargetDir'!" -ForegroundColor Green
+        Write-Host "  -> Switching to IN-PLACE UPDATE mode (skipping fresh clone)." -ForegroundColor Cyan
+    } else {
+        Write-Host "[WARNING] Folder '$TargetDir' exists but is NOT a Git repository." -ForegroundColor Yellow
+        $overwrite = Read-Host "Do you want to delete '$TargetDir' and clone fresh? (y/N)"
+        if ($overwrite.ToLower() -eq "y") {
+            Remove-Item -Path $FullTargetPath -Recurse -Force
+            Write-Host "[1/4] Cloning Master Repository into '$TargetDir'..." -ForegroundColor Cyan
+            git clone --progress $RepoUrl $FullTargetPath
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[ERROR] Git clone failed on Master Repository." -ForegroundColor Red
+                exit 1
+            }
+        } else {
+            Write-Host "[ERROR] Aborting setup to prevent overwriting non-Git folder." -ForegroundColor Red
+            exit 1
+        }
+    }
+} else {
+    Write-Host "[1/4] Cloning Master Repository into '$TargetDir'..." -ForegroundColor Cyan
+    git clone --progress $RepoUrl $FullTargetPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ERROR] Git clone failed on Master Repository." -ForegroundColor Red
+        exit 1
+    }
+}
+
+Push-Location $FullTargetPath
+
+try {
+    # 3. Configure / Update Master Repository Target
+    Write-Host "`n----------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "[2/4] Updating & Configuring Master Repository..." -ForegroundColor Cyan
+    
+    if ($isExistingRepo) {
+        Protect-WorkingTree -RepoName "[MASTER] $TargetDir" -Mode $Config.HandleUncommittedChanges
+    }
+
+    Write-Host "  -> Fetching latest remote branches and tags..." -ForegroundColor Gray
+    git fetch --all --tags --prune | Out-Null
+
+    # Safely evaluate desired Main Repo target without inline-if parser issues
+    if ([string]::IsNullOrWhiteSpace($Config.MainRepoTarget)) {
+        $desiredMain =$DefaultBranch
+    } else {
+        $desiredMain =$Config.MainRepoTarget
+    }
+
+    $mainRefCheck   = Test-GitRef -RefName $desiredMain$mainFinalState = ""
+
+    if ($mainRefCheck.Exists) {
+        Write-Host "  -> Checking out $($mainRefCheck.Type) '$desiredMain' on Master Repo..." -ForegroundColor Green
+        git checkout $mainRefCheck.FullRef
+        if ($mainRefCheck.Type -eq "Branch") {
+            git pull origin $desiredMain
+        }
+        $mainFinalState = "$($mainRefCheck.Type):$desiredMain"
+    } else {
+        Write-Host "  [!] Target '$desiredMain' not found in Master Repo! Falling back to '$DefaultBranch'." -ForegroundColor Yellow
+        git checkout $DefaultBranch
+        git pull origin $DefaultBranch
+        $mainFinalState = "Branch: $DefaultBranch (Fallback)"
+    }
+
+    # 4. Sync and Initialize Submodules
+    Write-Host "`n----------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "[3/4] Syncing and Initializing Submodules..." -ForegroundColor Cyan
+    
+    git submodule sync --recursive | Out-Null
+    git submodule update --init --recursive --progress
+
+    # Discover all submodules from .gitmodules without using $Matches
+    $discoveredSubmodules = @()
+    if (Test-Path ".gitmodules") {
+        $submoduleLines = @(git config --file .gitmodules --get-regexp path)
+        foreach ($line in $submoduleLines) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                $parts = $line -split '\s+', 2
+                if ($parts.Count -eq 2) {
+                    $discoveredSubmodules += $parts[1].Trim()
+                }
+            }
+        }
+    }
+
+    $summaryTable = @()
+    $operationType = $(if ($isExistingRepo) { "Updated" } else { "Cloned" })
+
+    if ($discoveredSubmodules.Count -eq 0) {
+        Write-Host "  [i] No submodules detected in .gitmodules." -ForegroundColor Yellow
+    } else {
+        Write-Host "`n----------------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host "[4/4] Updating Submodules ($($discoveredSubmodules.Count) found)..." -ForegroundColor Cyan
+
+        $counter = 0
+        foreach ($subPath in$discoveredSubmodules) {
+            $counter++$percent = [math]::Round(($counter / $discoveredSubmodules.Count) * 100)
+            Write-Progress -Activity "Updating Submodules" -Status "Processing $subPath ($counter of$($discoveredSubmodules.Count))" -PercentComplete $percent
+
+            Write-Host "`n  ========================================================" -ForegroundColor DarkCyan
+            Write-Host "  Submodule [$counter/$($discoveredSubmodules.Count)]: $subPath" -ForegroundColor Cyan
+            Write-Host "  ========================================================" -ForegroundColor DarkCyan
+
+            # Capture the exact commit hash pinned by the parent repo's current HEAD
+            $pinnedHash = (git rev-parse "HEAD:$subPath").Trim()
+            $shortPinned = $pinnedHash.Substring(0, 7)
+
+            # Match submodule in Config by full path or leaf folder name
+            $leafName = Split-Path $subPath -Leaf
+            $configuredTarget = $null
+
+            if ($Config.Submodules.ContainsKey($subPath)) {
+                $configuredTarget = $Config.Submodules[$subPath]
+            } elseif ($Config.Submodules.ContainsKey($leafName)) {
+                $configuredTarget = $Config.Submodules[$leafName]
+            } else {
+                Write-Host "  [i] Not listed in Config.Submodules. Defaulting to '$DefaultBranch'." -ForegroundColor DarkGray
+                $configuredTarget = ""
+            }
+
+            Push-Location $subPath
+            try {
+                if ($isExistingRepo) {
+                    Protect-WorkingTree -RepoName $subPath -Mode $Config.HandleUncommittedChanges
+                }
+
+                Write-Host "  -> Fetching latest remote changes for '$subPath'..." -ForegroundColor Gray
+                git fetch --all --tags --prune | Out-Null
+
+                $subFinalState = ""
+
+                # Case A: Blank -> Checkout Default/Refine Branch and Pull
+                if ([string]::IsNullOrWhiteSpace($configuredTarget)) {
+                    Write-Host "  -> Checking out Default/Refine branch '$DefaultBranch'..." -ForegroundColor Green
+                    git checkout $DefaultBranch
+                    git pull origin $DefaultBranch
+                    $subFinalState = "Branch: $DefaultBranch"
+                }
+                # Case B: Explicitly set to "pinned"
+                elseif ($configuredTarget.ToLower() -eq "pinned") {
+                    Write-Host "  -> Locking to Pinned commit ($shortPinned)..." -ForegroundColor Green
+                    git checkout $pinnedHash
+                    $subFinalState = "Pinned ($shortPinned)"
+                }
+                # Case C: Specific Tag or Refine Branch provided
+                else {
+                    $refCheck = Test-GitRef -RefName $configuredTarget
+                    if ($refCheck.Exists) {
+                        Write-Host "  -> Found $($refCheck.Type) '$configuredTarget'! Checking out..." -ForegroundColor Green
+                        git checkout $refCheck.FullRef
+                        if ($refCheck.Type -eq "Branch") {
+                            git pull origin $configuredTarget
+                        }
+                        $subFinalState = "$($refCheck.Type): $configuredTarget"
+                    } else {
+                        # Tag/Branch does NOT exist -> Use Fallback rule
+                        Write-Host "  [!] Target '$configuredTarget' not found in '$subPath'!" -ForegroundColor Red
+                        if ($Config.MissingTagFallback.ToLower() -eq "default") {
+                            Write-Host "  -> Fallback: Checking out '$DefaultBranch'..." -ForegroundColor Yellow
+                            git checkout $DefaultBranch
+                            git pull origin $DefaultBranch
+                            $subFinalState = "Branch: $DefaultBranch (Fallback)"
+                        } else {
+                            Write-Host "  -> Fallback: Locking to Pinned commit ($shortPinned)..." -ForegroundColor Yellow
+                            git checkout $pinnedHash
+                            $subFinalState = "Pinned: $shortPinned (Fallback)"
+                        }
+                    }
+                }
+
+                $currentSubCommit = (git rev-parse --short HEAD).Trim()
+            } finally {
+                Pop-Location
+            }
+
+            $configuredDisplay = $(if ([string]::IsNullOrWhiteSpace($configuredTarget)) { "<Default>" } else { $configuredTarget })
+
+            $summaryTable += [PSCustomObject]@{
+                Module     = $subPath
+                Operation  = $operationType
+                Configured = $configuredDisplay
+                FinalState = $subFinalState
+                CommitHash = $currentSubCommit
+            }
+        }
+        Write-Progress -Activity "Updating Submodules" -Completed
+    }
+
+    # 5. Visual Summary Table
+    $mainCommit = (git rev-parse --short HEAD).Trim()
+    Write-Host "`n==========================================================" -ForegroundColor Cyan
+    Write-Host "                 WORKSPACE SETUP SUMMARY                  " -ForegroundColor Cyan
+    Write-Host "==========================================================" -ForegroundColor Cyan
+
+    $mainConfiguredDisplay =$(if ([string]::IsNullOrWhiteSpace($Config.MainRepoTarget)) { "<Default>" } else { $Config.MainRepoTarget })
+
+    $masterRow = @([PSCustomObject]@{
+        Module     = "[MASTER] $TargetDir"
+        Operation  = $operationType
+        Configured = $mainConfiguredDisplay
+        FinalState = $mainFinalState
+        CommitHash = $mainCommit
+    })
+
+    ($masterRow +$summaryTable) | Format-Table -AutoSize
+
+    Write-Host "Workspace is ready at: $FullTargetPath" -ForegroundColor Green
+
+} finally {
+    Pop-Location
+}
