@@ -1,0 +1,30 @@
+# ==============================================================================
+#     CONFIG-DRIVEN MASTER & SUBMODULE CLONER / UPDATER
+# ==============================================================================
+
+$Config = @{
+    # 1. Master Repository Settings
+    MainRepoUrl              = "https://dev.azure.com/your-org/your-project/_git/master-repo"
+    TargetFolderName         = "master-workspace"
+    
+    # 2. Default / Refine Branch (used when a tag is not specified)
+    DefaultBranch            = "develop"
+    
+    # 3. Master Repo Target (Leave "" to use DefaultBranch, or set a tag/branch)
+    MainRepoTarget           = ""
+
+    # 4. Fallback if a Tag/Branch is missing ("pinned" or "default")
+    MissingTagFallback       = "pinned"
+
+    # 5. Uncommitted local changes mode ("stash", "prompt", or "ignore")
+    HandleUncommittedChanges = "stash"
+
+    # 6. Submodule Specific Configurations
+    #    ""           -> Uses DefaultBranch
+    #    "pinned"     -> Uses commit hash pinned by Master Repo
+    #    "v1.2.0"     -> Checks out tag (falls back if missing)
+    #    "refine/xyz" -> Checks out branch (falls back if missing)
+    Submodules               = @{
+        "mechanics" = ""
+        "controls"  = "v2.1.0"
+        "ELD"       = "
